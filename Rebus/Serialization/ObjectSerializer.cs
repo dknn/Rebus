@@ -1,42 +1,58 @@
 ﻿using System;
 using System.Text;
 using Newtonsoft.Json;
+// ReSharper disable UnusedMember.Global
 
-namespace Rebus.Serialization
+namespace Rebus.Serialization;
+
+/// <summary>
+/// Generic serializer that happily serializes rich objects. Uses JSON.NET internally with full type information.
+/// </summary>
+public class ObjectSerializer
 {
+    static readonly JsonSerializerSettings Settings = new JsonSerializerSettings { TypeNameHandling = TypeNameHandling.All };
+    static readonly Encoding TextEncoding = Encoding.UTF8;
+
     /// <summary>
-    /// Generic serializer that happily serializes rich objects. Uses JSON.NET internally with full type information.
+    /// Serializes the given object into a byte[]
     /// </summary>
-    public class ObjectSerializer
+    public byte[] Serialize(object obj)
     {
-        static readonly JsonSerializerSettings Settings = new JsonSerializerSettings { TypeNameHandling = TypeNameHandling.All };
-        static readonly Encoding TextEncoding = Encoding.UTF8;
+        var jsonString = SerializeToString(obj);
 
-        /// <summary>
-        /// Serializes the given object into a byte[]
-        /// </summary>
-        public byte[] Serialize(object obj)
+        return TextEncoding.GetBytes(jsonString);
+    }
+
+    /// <summary>
+    /// Serializes the given object into a string
+    /// </summary>
+    public string SerializeToString(object obj)
+    {
+        return JsonConvert.SerializeObject(obj, Settings);
+    }
+
+    /// <summary>
+    /// Deserializes the given byte[] into an object
+    /// </summary>
+    public object Deserialize(byte[] bytes)
+    {
+        var jsonString = TextEncoding.GetString(bytes);
+
+        return DeserializeFromString(jsonString);
+    }
+
+    /// <summary>
+    /// Deserializes the given string into an object
+    /// </summary>
+    public object DeserializeFromString(string str)
+    {
+        try
         {
-            var jsonString = JsonConvert.SerializeObject(obj, Settings);
-
-            return TextEncoding.GetBytes(jsonString);
+            return JsonConvert.DeserializeObject(str, Settings);
         }
-
-        /// <summary>
-        /// Deserializes the given byte[] into an object
-        /// </summary>
-        public object Deserialize(byte[] bytes)
+        catch (Exception exception)
         {
-            var jsonString = TextEncoding.GetString(bytes);
-
-            try
-            {
-                return JsonConvert.DeserializeObject(jsonString, Settings);
-            }
-            catch (Exception exception)
-            {
-                throw new JsonSerializationException(string.Format("Could not deserialize '{0}'", jsonString), exception);
-            }
+            throw new JsonSerializationException($"Could not deserialize '{str}'", exception);
         }
     }
 }

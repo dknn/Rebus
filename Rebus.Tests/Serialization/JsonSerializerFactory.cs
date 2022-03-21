@@ -1,16 +1,13 @@
-using NUnit.Framework;
 using Rebus.Serialization;
+using Rebus.Serialization.Json;
+using Rebus.Tests.Contracts.Serialization;
 
-namespace Rebus.Tests.Serialization
+namespace Rebus.Tests.Serialization;
+
+public class JsonSerializerFactory : ISerializerFactory
 {
-    [TestFixture]
-    public class JsonSerializerTests : BasicSerializationTests<JsonSerializerFactory> { }
-
-    public class JsonSerializerFactory : ISerializerFactory
+    public ISerializer GetSerializer()
     {
-        public ISerializer GetSerializer()
-        {
-            return new JsonSerializer();
-        }
+        return new JsonSerializer(new SimpleAssemblyQualifiedMessageTypeNameConvention());
     }
 }

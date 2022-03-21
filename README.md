@@ -1,88 +1,129 @@
-# Rebus 2
+# Rebus
 
-#### _"As friendly as machinely possible."_
+![](https://raw.githubusercontent.com/rebus-org/Rebus/master/artwork/little_rebusbus2_copy-200x200.png)
 
-NOTE: This is Rebus2 - if you've used Rebus before up until version 0.84.0, you will experience a minor bump in the road when you update to 0.90.0, which functions as the beta versions until Rebus 2.0.0 is ready!
+Latest stable: [![NuGet stable](https://img.shields.io/nuget/v/Rebus.svg?style=flat-square)](https://www.nuget.org/packages/Rebus)
 
-Moreover - since the wiki actually contains quite a bit of content - please be patient until the content has been updated to reflect Rebus 2 :)
+Current prerelease: [![NuGet pre](https://img.shields.io/nuget/vpre/Rebus.svg?style=flat-square)](https://www.nuget.org/packages/Rebus)
 
-![Bedford OB](http://mookid.dk/oncode/wp-content/2015/07/small-bus-logo-1.png)
+Tests: [![Build status](https://ci.appveyor.com/api/projects/status/gk13466i0o57o4rp?svg=true)](https://ci.appveyor.com/project/mookid8000/rebus)
 
-[![install from nuget](http://img.shields.io/nuget/v/Rebus.svg?style=flat-square)](https://www.nuget.org/packages/Rebus)[![downloads](http://img.shields.io/nuget/dt/Rebus.svg?style=flat-square)](https://www.nuget.org/packages/Rebus)
+This repository contains Rebus "core". You may also be interested in one of [the many integration libraries](https://github.com/rebus-org?utf8=%E2%9C%93&q=rebus.). 
+
+For information about the commercial add-on (support, tooling, etc.) to Rebus, please visit [Rebus FM's page about Rebus Pro](https://rebus.fm/rebus-pro/).
 
 
 What?
 ====
 
-Rebus is a lean service bus implementation for .NET, similar in nature to [NServiceBus][3] and [MassTransit][4], only leaner.
+Rebus is a lean service bus implementation for .NET. It is what ThoughtWorks in 2010 called a 
+["message bus without smarts"](https://www.thoughtworks.com/radar/tools/message-buses-without-smarts) - a library 
+that works well as the "dumb pipes" when you need asynchronous communication in your microservices that follow
+the ["smart endpoints, dumb pipes"](https://martinfowler.com/articles/microservices.html#SmartEndpointsAndDumbPipes) 
+principle.
 
-These are the goals - Rebus should have:
+Rebus aims to have
 
 * a simple and intuitive configuration story
 * a few well-selected options
 * no doodleware
-* dependency only on .NET 4.5
-* integration with external dependencies via small and dedicated projects
-* the best error messages
+* as few dependencies as possible (currently only [JSON.NET][JSON])
+* a broad reach (targets .NET 4.5, .NET 4.6, and .NET Standard 2.0, i.e. full .NET fx and .NET core)
+* integration with external dependencies via small, dedicated projects
+* the best error messages in the world
 * a frictionless getting-up-and-running-experience
 
-and in doing this, Rebus should align very well with the NServiceBus way of doing things, which I like, thus allowing users (myself included) to easily migrate to NServiceBus at some point in a project's lifetime if Rebus for some reason falls short (which I don't think it will).
+and in doing this, Rebus should try to align itself with common, proven asynchronous messaging patterns.
 
-Oh, and Rebus is free as in beer and speech.
+Oh, and Rebus is FREE as in beer and speech, and it will stay that way forever.
 
-Why?
+More information
 ====
 
-Because I wanted to build the .NET service bus that I would have the patience to work with every day, probably for several years to come. And I can be very impatient with my tools, so the most solemn goal of Rebus is that it should stay out of my way - and I think it does that just right!
+If you want to read more, check out [the official Rebus documentation wiki][REBUS_WIKI] or check out [my blog][REBUS_PAGE_ON_BLOG].
 
-If you want to read more, check out [the official Rebus documentation wiki][5] or check out [my blog][6].
+You can also follow me on Twitter: [@mookid8000][MOOKID8000_ON_TWITTER]
 
-One day, maybe I'll tweet something as well... [@mookid8000][2]
-
-How?
+Getting started
 ====
 
-Rebus is a simple .NET library, and everything revolves around the `RebusBus` class. One way to get Rebus up and running, is to manually go
+Rebus is a simple .NET library, and everything revolves around the `RebusBus` class. One way to get Rebus
+up and running, is to manually go
 
-	var bus = new RebusBus(...);
-	bus.Start(1); //< 1 worker thread
+```csharp
+var bus = new RebusBus(...);
+bus.Start(1); //< 1 worker thread
 
-	// use the bus for the duration of the application lifetime
+// use the bus for the duration of the application lifetime
 
-	// remember to dispose the bus when your application exits
-	bus.Dispose();
+// remember to dispose the bus when your application exits
+bus.Dispose();
+```
 
-where `...` is a bunch of dependencies that vary depending on how you want to send/receive messages etc. Another way is to use the configuration API, in which case you would go
+where `...` is a bunch of dependencies that vary depending on how you want to send/receive messages etc.
+Another way is to use the configuration API, in which case you would go
 
-    var someContainerAdapter = new BuiltinHandlerActivator();
+
+```csharp
+var someContainerAdapter = new BuiltinHandlerActivator();
+```
 
 for the built-in container adapter, or
 
-    var someContainerAdapter = new AdapterForMyFavoriteIocContainer(myFavoriteIocContainer);
+```csharp
+var someContainerAdapter = new AdapterForMyFavoriteIocContainer(myFavoriteIocContainer);
+```
 
 to integrate with your favorite IoC container, and then
 
-	Configure.With(someContainerAdapter)
-		.Logging(l => l.Serilog())
-		.Transport(t => t.UseMsmq("myInputQueue"))
-		.Routing(r => r.TypeBased().MapAssemblyOf<SomeMessageType>("anotherInputQueue"))
-		.Start();
+```csharp
+Configure.With(someContainerAdapter)
+    .Logging(l => l.Serilog())
+    .Transport(t => t.UseMsmq("myInputQueue"))
+    .Routing(r => r.TypeBased().MapAssemblyOf<SomeMessageType>("anotherInputQueue"))
+    .Start();
 
-	// have IBus injected in application services for the duration of the application lifetime
+// have IBus injected in application services for the duration of the application lifetime    
 
-	// let the container dispose the bus when your application exits
-	myFavoriteIocContainer.Dispose();
+// let the container dispose the bus when your application exits
+myFavoriteIocContainer.Dispose();
+```
 
-which will stuff the resulting `IBus` in the container as a singleton and use the container to look up message handlers. Check out the Configuration section on [the official Rebus documentation wiki][5] for more information on how to do this.
+which will stuff the resulting `IBus` in the container as a singleton and use the container to look up
+message handlers. Check out the Configuration section on [the official Rebus documentation wiki][REBUS_WIKI] for
+more information on how to do this.
+
+If you want to be more specific about what types you map in an assembly, such as if the assembly is shared with other code you can map all the types under a specific namespace like this:
+
+```csharp
+Configure.With(someContainerAdapter)
+    .(...)
+    .Routing(r => r.TypeBased().MapAssemblyNamespaceOf<SomeMessageType>("namespaceInputQueue"))
+    .(...);
+
+// have IBus injected in application services for the duration of the application lifetime    
+
+// let the container dispose the bus when your application exits
+myFavoriteIocContainer.Dispose();
+```
+
 
 License
 ====
 
-Rebus is licensed under [The MIT License (MIT)][1]. Basically, this license grants you the right to use Rebus in any way you see fit. See [LICENSE.md](/LICENSE.md) for more info.
+Rebus is licensed under [The MIT License (MIT)][MITLICENSE]. Basically, this license grants you the right to use
+Rebus in any way you see fit. See [LICENSE.md](/LICENSE.md) for more info.
 
-[1]: http://opensource.org/licenses/MIT
-[2]: http://twitter.com/#!/mookid8000
-[3]: http://nservicebus.com/
-[4]: http://masstransit-project.com/
-[5]: https://github.com/mookid8000/Rebus/wiki
-[6]: http://mookid.dk/oncode/rebus
+The purpose of the license is to make it easy for everyone to use Rebus and its accompanying integration
+libraries. If that is not the case, please get in touch with [hello@rebus.fm](mailto:hello@rebus.fm)
+and then we will work something out.
+
+
+[MITLICENSE]: https://raw.githubusercontent.com/rebus-org/Rebus/batches/LICENSE.md
+[MOOKID8000_ON_TWITTER]: https://twitter.com/mookid8000
+[REBUS_WIKI]: https://github.com/rebus-org/Rebus/wiki
+[REBUS_PAGE_ON_BLOG]: http://mookid.dk/oncode/rebus
+
+[JSON]: https://github.com/JamesNK/Newtonsoft.Json
+
+[//]: [![downloads](http://img.shields.io/nuget/dt/Rebus.svg?style=flat-square)](https://www.nuget.org/packages/Rebus)

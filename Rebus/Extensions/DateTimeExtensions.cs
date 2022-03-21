@@ -2,42 +2,39 @@
 using System.Globalization;
 using Rebus.Time;
 
-namespace Rebus.Extensions
+namespace Rebus.Extensions;
+
+/// <summary>
+/// Defines a few nice extensions for making working with <see cref="DateTimeOffset"/> more nice
+/// </summary>
+public static class DateTimeExtensions
 {
     /// <summary>
-    /// Defines a few nice extensions for making working with <see cref="DateTimeOffset"/> more nice
+    /// Gets the time from this instant until now (as returned by <see cref="IRebusTime.Now"/>)
     /// </summary>
-    public static class DateTimeExtensions
+    public static TimeSpan ElapsedUntilNow(this DateTimeOffset dateTime, IRebusTime rebusTime)
     {
-        /// <summary>
-        /// Gets the time from this instant until now (as returned by <see cref="RebusTime.Now"/>)
-        /// </summary>
-        public static TimeSpan ElapsedUntilNow(this DateTimeOffset dateTime)
+        return rebusTime.Now - dateTime.ToUniversalTime();
+    }
+
+    /// <summary>
+    /// Serializes this instant with the "O" format, i.e. ISO8601-compliant
+    /// </summary>
+    public static string ToIso8601DateTimeOffset(this DateTimeOffset dateTimeOffset)
+    {
+        return dateTimeOffset.ToString("O", CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// Parses an ISO8601-compliant string into a proper <see cref="DateTimeOffset"/>
+    /// </summary>
+    public static DateTimeOffset ToDateTimeOffset(this string iso8601String)
+    {
+        if (!DateTimeOffset.TryParseExact(iso8601String, "O", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var result))
         {
-            return RebusTime.Now - dateTime.ToUniversalTime();
+            throw new FormatException($"Could not parse '{iso8601String}' as a proper ISO8601-formatted DateTimeOffset!");
         }
 
-        /// <summary>
-        /// Serializes this instant with the "O" format, i.e. ISO8601-compliant
-        /// </summary>
-        public static string ToIso8601DateTimeOffset(this DateTimeOffset dateTimeOffset)
-        {
-            return dateTimeOffset.ToString("O", CultureInfo.InvariantCulture);
-        }
-
-        /// <summary>
-        /// Parses an ISO8601-compliant string into a proper <see cref="DateTimeOffset"/>
-        /// </summary>
-        public static DateTimeOffset ToDateTimeOffset(this string iso8601String)
-        {
-            DateTimeOffset result;
-
-            if (!DateTimeOffset.TryParseExact(iso8601String, "O", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out result))
-            {
-                throw new FormatException(string.Format("Could not parse '{0}' as a proper ISO8601-formatted DateTimeOffset!", iso8601String));
-            }
-
-            return result;
-        }
+        return result;
     }
 }

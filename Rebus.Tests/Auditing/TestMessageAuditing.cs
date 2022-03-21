@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -9,114 +8,104 @@ using Rebus.Auditing.Messages;
 using Rebus.Bus;
 using Rebus.Config;
 using Rebus.Messages;
-using Rebus.Tests.Extensions;
+using Rebus.Persistence.InMem;
+using Rebus.Tests.Contracts;
+using Rebus.Tests.Contracts.Extensions;
 using Rebus.Transport.InMem;
+#pragma warning disable 1998
 
-namespace Rebus.Tests.Auditing
+namespace Rebus.Tests.Auditing;
+
+[TestFixture]
+public class TestMessageAuditing : FixtureBase
 {
-    [TestFixture]
-    public class TestMessageAuditing : FixtureBase
+    IBus _bus;
+    BuiltinHandlerActivator _adapter;
+    InMemNetwork _network;
+    IBusStarter _starter;
+
+    protected override void SetUp()
     {
-        IBus _bus;
-        BuiltinHandlerActivator _adapter;
-        InMemNetwork _network;
+        _adapter = new BuiltinHandlerActivator();
 
-        protected override void SetUp()
-        {
-            _adapter = new BuiltinHandlerActivator();
-            _network = new InMemNetwork();
+        Using(_adapter);
+
+        _network = new InMemNetwork();
             
-            _bus = Configure.With(_adapter)
-                .Transport(t => t.UseInMemoryTransport(_network, "test"))
-                .Options(o =>
-                {
-                    o.LogPipeline(true);
-                    o.EnableMessageAuditing("audit");
-                })
-                .Start();
-        }
-
-        [Test]
-        public async Task DoesNotCopyFailedMessage()
-        {
-            _adapter.Handle<string>(async _ =>
+        _starter = Configure.With(_adapter)
+            .Transport(t => t.UseInMemoryTransport(_network, "test"))
+            .Subscriptions(s => s.StoreInMemory())
+            .Options(o =>
             {
-                throw new Exception("w00t!!");
-            });
+                o.LogPipeline(true);
+                o.EnableMessageAuditing("audit");
+            })
+            .Create();
 
-            await _bus.SendLocal("woohooo!!!!");
+        _bus = _starter.Bus;
+    }
 
-            await Task.Delay(TimeSpan.FromSeconds(3));
+    [Test]
+    public async Task DoesNotCopyFailedMessage()
+    {
+        _adapter.Handle<string>(async _ => throw new Exception("w00t!!"));
 
-            var message = _network.GetNextOrNull("audit");
+        _starter.Start();
 
-            Assert.That(message, Is.Null, "Apparently, a message copy was received anyway!!");
-        }
+        await _bus.SendLocal("woohooo!!!!");
 
-        [Test]
-        public async Task CopiesProperlyHandledMessageToAuditQueue()
+        await Task.Delay(TimeSpan.FromSeconds(3));
+
+        var message = _network.GetNextOrNull("audit");
+
+        Assert.That(message, Is.Null, "Apparently, a message copy was received anyway!!");
+    }
+
+    [Test]
+    public async Task CopiesProperlyHandledMessageToAuditQueue()
+    {
+        var gotTheMessage = new ManualResetEvent(false);
+
+        _adapter.Handle<string>(async _ =>
         {
-            var gotTheMessage = new ManualResetEvent(false);
+            gotTheMessage.Set();
+        });
 
-            _adapter.Handle<string>(async _ =>
-            {
-                gotTheMessage.Set();
-            });
+        _starter.Start();
 
-            await _bus.SendLocal("woohooo!!!!");
+        await _bus.SendLocal("woohooo!!!!");
 
-            gotTheMessage.WaitOrDie(TimeSpan.FromSeconds(5));
+        gotTheMessage.WaitOrDie(TimeSpan.FromSeconds(5));
 
-            InMemTransportMessage message;
-            var timer = Stopwatch.StartNew();
+        var message = await _network.WaitForNextMessageFrom("audit");
 
-            while ((message = _network.GetNextOrNull("audit")) == null)
-            {
-                await Task.Delay(200);
+        PrintHeaders(message);
 
-                if (timer.Elapsed > TimeSpan.FromSeconds(2))
-                {
-                    Assert.Fail("Did not receive message copy within 2 seconds of waiting....");
-                }
-            }
+        Assert.That(message.Headers.ContainsKey(AuditHeaders.AuditTime));
+        Assert.That(message.Headers.ContainsKey(AuditHeaders.HandleTime));
+        Assert.That(message.Headers.ContainsKey(Headers.Intent));
+        Assert.That(message.Headers[Headers.Intent], Is.EqualTo(Headers.IntentOptions.PointToPoint));
+    }
 
-            PrintHeaders(message);
+    [Test]
+    public async Task CopiesPublishedMessageToAuditQueue()
+    {
+        _starter.Start();
 
-            Assert.That(message.Headers.ContainsKey(AuditHeaders.AuditTime));
-            Assert.That(message.Headers.ContainsKey(AuditHeaders.HandleTime));
-            Assert.That(message.Headers.ContainsKey(Headers.Intent));
-            Assert.That(message.Headers[Headers.Intent], Is.EqualTo(Headers.IntentOptions.PointToPoint));
-        }
+        await _bus.Advanced.Topics.Publish("TOPIC: 'whocares/nosubscribers'", "woohooo!!!!");
 
-        static void PrintHeaders(InMemTransportMessage message)
-        {
-            Console.WriteLine(@"Headers:
-{0}", string.Join(Environment.NewLine, message.Headers.Select(kvp => string.Format("    {0}: {1}", kvp.Key, kvp.Value))));
-        }
+        var message = await _network.WaitForNextMessageFrom("audit");
 
-        [Test]
-        public async Task CopiesPublishedMessageToAuditQueue()
-        {
-            await _bus.Advanced.Topics.Publish("TOPIC: 'whocares/nosubscribers'", "woohooo!!!!");
+        PrintHeaders(message);
 
-            InMemTransportMessage message;
-            var timer = Stopwatch.StartNew();
+        Assert.That(message.Headers.ContainsKey(AuditHeaders.AuditTime));
+        Assert.That(message.Headers.ContainsKey(Headers.Intent));
+        Assert.That(message.Headers[Headers.Intent], Is.EqualTo(Headers.IntentOptions.PublishSubscribe));
+    }
 
-            while ((message = _network.GetNextOrNull("audit")) == null)
-            {
-                await Task.Delay(200);
-
-                if (timer.Elapsed > TimeSpan.FromSeconds(2))
-                {
-                    Assert.Fail("Did not receive message copy within 2 seconds of waiting....");
-                }
-            }
-
-            PrintHeaders(message);
-
-            Assert.That(message.Headers.ContainsKey(AuditHeaders.AuditTime));
-            Assert.That(message.Headers.ContainsKey(Headers.Intent));
-            Assert.That(message.Headers[Headers.Intent], Is.EqualTo(Headers.IntentOptions.PublishSubscribe));
-        }
+    static void PrintHeaders(TransportMessage message)
+    {
+        Console.WriteLine(@"Headers:
+{0}", string.Join(Environment.NewLine, message.Headers.Select(kvp => $"    {kvp.Key}: {kvp.Value}")));
     }
 }

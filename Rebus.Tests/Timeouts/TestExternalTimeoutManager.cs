@@ -9,81 +9,83 @@ using Rebus.Bus;
 using Rebus.Config;
 using Rebus.Extensions;
 using Rebus.Messages;
-using Rebus.Tests.Extensions;
-using Rebus.Transport.Msmq;
+using Rebus.Persistence.InMem;
+using Rebus.Tests.Contracts;
+using Rebus.Tests.Contracts.Extensions;
+using Rebus.Tests.Contracts.Utilities;
+using Rebus.Timeouts;
+using Rebus.Transport.InMem;
+
 #pragma warning disable 1998
 
-namespace Rebus.Tests.Timeouts
+namespace Rebus.Tests.Timeouts;
+
+[TestFixture]
+public class TestExternalTimeoutManager : FixtureBase
 {
-    [TestFixture, Category(Categories.Msmq)]
-    public class TestExternalTimeoutManager : FixtureBase
+    readonly string _queueName = TestConfig.GetName("client");
+    readonly string _queueNameTimeoutManager = TestConfig.GetName("manager");
+
+    ManualResetEvent _gotTheMessage;
+    IBus _bus;
+    InMemNetwork _network;
+
+    protected override void SetUp()
     {
-        readonly string _queueName = TestConfig.QueueName("client");
-        readonly string _queueNameTimeoutManager = TestConfig.QueueName("manager");
+        var logger = new ListLoggerFactory(detailed: true);
 
-        ManualResetEvent _gotTheMessage;
-        IBus _bus;
+        _network = new InMemNetwork();
 
-        protected override void SetUp()
+        // start the external timeout manager
+        Configure.With(Using(new BuiltinHandlerActivator()))
+            .Logging(l => l.Use(logger))
+            .Transport(t => t.UseInMemoryTransport(_network, _queueNameTimeoutManager))
+            .Timeouts(t => t.StoreInMemory())
+            .Start();
+
+        _gotTheMessage = new ManualResetEvent(false);
+
+        // start the client
+        var client = Using(new BuiltinHandlerActivator());
+
+        client.Handle<string>(async str => _gotTheMessage.Set());
+
+        Configure.With(client)
+            .Logging(l => l.Use(logger))
+            .Transport(t => t.UseInMemoryTransport(_network, _queueName))
+            .Timeouts(t => t.UseExternalTimeoutManager(_queueNameTimeoutManager))
+            .Start();
+
+        _bus = client.Bus;
+    }
+
+    [Test]
+    public async Task ItWorksEvenThoughDeferredMessageIsAccidentallyReceived()
+    {
+        var headers = new Dictionary<string, string>
         {
-            var logger = new ListLoggerFactory(detailed: true);
+            {Headers.DeferredUntil, DateTimeOffset.Now.Add(TimeSpan.FromSeconds(5)).ToIso8601DateTimeOffset()},
+            {Headers.DeferredRecipient, _queueName}
+        };
 
-            // start the external timeout manager
-            Configure.With(Using(new BuiltinHandlerActivator()))
-                .Logging(l => l.Use(logger))
-                .Transport(t => t.UseMsmq(_queueNameTimeoutManager))
-                .Start();
+        var stopwatch = Stopwatch.StartNew();
 
-            _gotTheMessage = new ManualResetEvent(false);
+        await _bus.SendLocal("denne besked skal stadig udsættes!", headers);
 
-            // start the client
-            var client = Using(new BuiltinHandlerActivator());
+        _gotTheMessage.WaitOrDie(TimeSpan.FromSeconds(8.5), "Message was not received within 8,5 seconds (which it should have been since it was only deferred 5 seconds)");
 
-            client.Handle<string>(async str => _gotTheMessage.Set());
+        Assert.That(stopwatch.Elapsed, Is.GreaterThan(TimeSpan.FromSeconds(4.5)), "It must take more than 5 second to get the message back (although we allow for a little bit of tolerance in this test....)");
+    }
 
-            Configure.With(client)
-                .Logging(l => l.Use(logger))
-                .Transport(t => t.UseMsmq(_queueName))
-                .Options(o => o.UseExternalTimeoutManager(_queueNameTimeoutManager))
-                .Start();
+    [Test]
+    public async Task ItWorks()
+    {
+        var stopwatch = Stopwatch.StartNew();
 
-            _bus = client.Bus;
-        }
+        await _bus.DeferLocal(TimeSpan.FromSeconds(5), "hej med dig min ven!");
 
-        [Test]
-        public async Task ItWorksEvenThoughDeferredMessageIsAccidentallyReceived()
-        {
-            var headers = new Dictionary<string, string>
-            {
-                {Headers.DeferredUntil, DateTimeOffset.Now.Add(TimeSpan.FromSeconds(5)).ToIso8601DateTimeOffset()},
-                {Headers.DeferredRecipient, _queueName}
-            };
+        _gotTheMessage.WaitOrDie(TimeSpan.FromSeconds(8.5), "Message was not received within 8,5 seconds (which it should have been since it was only deferred 5 seconds)");
 
-            var stopwatch = Stopwatch.StartNew();
-
-            await _bus.SendLocal("denne besked skal stadig udsættes!", headers);
-
-            _gotTheMessage.WaitOrDie(TimeSpan.FromSeconds(6.5), "Message was not received within 6,5 seconds (which it should have been since it was only deferred 5 seconds)");
-
-            Assert.That(stopwatch.Elapsed, Is.GreaterThan(TimeSpan.FromSeconds(5)), "It must take more than 5 second to get the message back");
-        }
-
-        [Test]
-        public async Task ItWorks()
-        {
-            var stopwatch = Stopwatch.StartNew();
-
-            await _bus.Defer(TimeSpan.FromSeconds(5), "hej med dig min ven!");
-
-            _gotTheMessage.WaitOrDie(TimeSpan.FromSeconds(8.5), "Message was not received within 8,5 seconds (which it should have been since it was only deferred 5 seconds)");
-
-            Assert.That(stopwatch.Elapsed, Is.GreaterThan(TimeSpan.FromSeconds(5)), "It must take more than 5 second to get the message back");
-        }
-
-        protected override void TearDown()
-        {
-            MsmqUtil.Delete(_queueName);
-            MsmqUtil.Delete(_queueNameTimeoutManager);
-        }
+        Assert.That(stopwatch.Elapsed, Is.GreaterThan(TimeSpan.FromSeconds(5)), "It must take more than 5 second to get the message back");
     }
 }

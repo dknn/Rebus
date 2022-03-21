@@ -4,36 +4,44 @@ using System.Linq;
 using System.Threading.Tasks;
 using NUnit.Framework;
 using Rebus.Activation;
-using Rebus.Bus;
 using Rebus.Config;
+using Rebus.Persistence.InMem;
 using Rebus.Sagas;
-using Rebus.Tests.Extensions;
+using Rebus.Tests.Contracts;
+using Rebus.Tests.Contracts.Extensions;
+using Rebus.Tests.Contracts.Utilities;
 using Rebus.Transport.InMem;
+#pragma warning disable 1998
 
-namespace Rebus.Tests.Integration
+namespace Rebus.Tests.Integration;
+
+[TestFixture]
+public class TestSagaIsNew : FixtureBase
 {
-    [TestFixture]
-    public class TestSagaIsNew : FixtureBase
+    BuiltinHandlerActivator _activator;
+    IBusStarter _busStarter;
+
+    protected override void SetUp()
     {
-        BuiltinHandlerActivator _activator;
-        IBus _bus;
+        _activator = Using(new BuiltinHandlerActivator());
 
-        protected override void SetUp()
-        {
-            _activator = Using(new BuiltinHandlerActivator());
+        _busStarter = Configure.With(_activator)
+            .Transport(t => t.UseInMemoryTransport(new InMemNetwork(), "saga_is_new"))
+            .Sagas(s => s.StoreInMemory())
+            .Options(o =>
+            {
+                o.SetNumberOfWorkers(1);
+                o.SetMaxParallelism(1);
+            })
+            .Create();
+    }
 
-            _bus = Configure.With(_activator)
-                .Transport(t => t.UseInMemoryTransport(new InMemNetwork(), "saga_is_new"))
-                .Options(o => o.SetNumberOfWorkers(1).SetMaxParallelism(1))
-                .Start();
-        }
+    [Test]
+    public async Task CanCorrectlyDetermineWhetherSagaInstanceIsNew()
+    {
+        var eventsPerCorrelationId = new ConcurrentDictionary<string, ConcurrentQueue<bool>>();
 
-        [Test]
-        public async Task CanCorrectlyDetermineWhetherSagaInstanceIsNew()
-        {
-            var eventsPerCorrelationId = new ConcurrentDictionary<string, ConcurrentQueue<bool>>();
-
-            var messages = new[]
+        var messages = new[]
             {
                 "1/hej",
                 "1/hej",
@@ -51,66 +59,68 @@ namespace Rebus.Tests.Integration
                 "4/hej",
                 "4/hej",
             }
-                .InRandomOrder()
-                .ToArray();
+            .InRandomOrder()
+            .ToArray();
 
-            var counter = new SharedCounter(messages.Length);
+        var counter = new SharedCounter(messages.Length);
 
-            Using(counter);
+        Using(counter);
 
-            _activator.Register(() => new MySaga(eventsPerCorrelationId, counter));
+        _activator.Register(() => new MySaga(eventsPerCorrelationId, counter));
+        _busStarter.Start();
 
-            await Task.WhenAll(messages.Select(message => _bus.SendLocal(message)));
+        var bus = _activator.Bus;
 
-            counter.WaitForResetEvent();
+        await Task.WhenAll(messages.Select(message => bus.SendLocal(message)));
 
-            Assert.That(eventsPerCorrelationId.Count, Is.EqualTo(4));
+        counter.WaitForResetEvent();
 
-            Assert.That(eventsPerCorrelationId["1"], Is.EqualTo(new[] { true, false, false }));
-            Assert.That(eventsPerCorrelationId["2"], Is.EqualTo(new[] { true, false }));
-            Assert.That(eventsPerCorrelationId["3"], Is.EqualTo(new[] { true, }));
-            Assert.That(eventsPerCorrelationId["4"], Is.EqualTo(new[] { true, false, false, false, false, false, }));
-        }
+        Assert.That(eventsPerCorrelationId.Count, Is.EqualTo(4));
 
-        class MySaga : Saga<MySagaData>, IAmInitiatedBy<string>
+        Assert.That(eventsPerCorrelationId["1"], Is.EqualTo(new[] { true, false, false }));
+        Assert.That(eventsPerCorrelationId["2"], Is.EqualTo(new[] { true, false }));
+        Assert.That(eventsPerCorrelationId["3"], Is.EqualTo(new[] { true, }));
+        Assert.That(eventsPerCorrelationId["4"], Is.EqualTo(new[] { true, false, false, false, false, false, }));
+    }
+
+    class MySaga : Saga<MySagaData>, IAmInitiatedBy<string>
+    {
+        readonly ConcurrentDictionary<string, ConcurrentQueue<bool>> _eventsPerCorrelationId;
+        readonly SharedCounter _counter;
+
+        public MySaga(ConcurrentDictionary<string, ConcurrentQueue<bool>> eventsPerCorrelationId, SharedCounter counter)
         {
-            readonly ConcurrentDictionary<string, ConcurrentQueue<bool>> _eventsPerCorrelationId;
-            readonly SharedCounter _counter;
-
-            public MySaga(ConcurrentDictionary<string, ConcurrentQueue<bool>> eventsPerCorrelationId, SharedCounter counter)
-            {
-                _eventsPerCorrelationId = eventsPerCorrelationId;
-                _counter = counter;
-            }
-
-            protected override void CorrelateMessages(ICorrelationConfig<MySagaData> config)
-            {
-                config.Correlate<string>(GetCorrelationId, d => d.CorrelationId);
-            }
-
-            public async Task Handle(string message)
-            {
-                Data.CorrelationId = GetCorrelationId(message);
-
-                var events = _eventsPerCorrelationId
-                    .GetOrAdd(Data.CorrelationId, key => new ConcurrentQueue<bool>());
-
-                events.Enqueue(IsNew);
-
-                _counter.Decrement();
-            }
-
-            static string GetCorrelationId(string s)
-            {
-                return s.Split('/').First();
-            }
+            _eventsPerCorrelationId = eventsPerCorrelationId;
+            _counter = counter;
         }
 
-        class MySagaData : ISagaData
+        protected override void CorrelateMessages(ICorrelationConfig<MySagaData> config)
         {
-            public Guid Id { get; set; }
-            public int Revision { get; set; }
-            public string CorrelationId { get; set; }
+            config.Correlate<string>(GetCorrelationId, d => d.CorrelationId);
         }
+
+        public async Task Handle(string message)
+        {
+            Data.CorrelationId = GetCorrelationId(message);
+
+            var events = _eventsPerCorrelationId
+                .GetOrAdd(Data.CorrelationId, key => new ConcurrentQueue<bool>());
+
+            events.Enqueue(IsNew);
+
+            _counter.Decrement();
+        }
+
+        static string GetCorrelationId(string s)
+        {
+            return s.Split('/').First();
+        }
+    }
+
+    class MySagaData : ISagaData
+    {
+        public Guid Id { get; set; }
+        public int Revision { get; set; }
+        public string CorrelationId { get; set; }
     }
 }

@@ -6,191 +6,240 @@ using System.Threading.Tasks;
 using Rebus.Bus;
 using Rebus.Extensions;
 using Rebus.Logging;
+using Rebus.Retry.Simple;
 using Rebus.Threading;
 using Rebus.Time;
+using Rebus.Transport;
+// ReSharper disable RedundantArgumentDefaultValue
+// ReSharper disable ArgumentsStyleLiteral
 
 #pragma warning disable 1998
 
-namespace Rebus.Retry.ErrorTracking
+namespace Rebus.Retry.ErrorTracking;
+
+/// <summary>
+/// Implementation of <see cref="IErrorTracker"/> that tracks errors in an in-mem dictionary
+/// </summary>
+public class InMemErrorTracker : IErrorTracker, IInitializable, IDisposable
 {
+    const string BackgroundTaskName = "CleanupTrackedErrors";
+
+    readonly ILog _log;
+    readonly SimpleRetryStrategySettings _simpleRetryStrategySettings;
+    readonly ITransport _transport;
+    readonly IRebusTime _rebusTime;
+    readonly ConcurrentDictionary<string, ErrorTracking> _trackedErrors = new ConcurrentDictionary<string, ErrorTracking>();
+    readonly IAsyncTask _cleanupOldTrackedErrorsTask;
+
+    bool _disposed;
+
     /// <summary>
-    /// Implementation of <see cref="IErrorTracker"/> that tracks errors in an in-mem dictionary
+    /// Constructs the in-mem error tracker with the configured number of delivery attempts as the MAX
     /// </summary>
-    public class InMemErrorTracker : IErrorTracker, IInitializable, IDisposable
+    public InMemErrorTracker(SimpleRetryStrategySettings simpleRetryStrategySettings, IRebusLoggerFactory rebusLoggerFactory, IAsyncTaskFactory asyncTaskFactory, ITransport transport, IRebusTime rebusTime)
     {
-        const string BackgroundTaskName = "CleanupTrackedErrors";
+        if (rebusLoggerFactory == null) throw new ArgumentNullException(nameof(rebusLoggerFactory));
+        if (asyncTaskFactory == null) throw new ArgumentNullException(nameof(asyncTaskFactory));
 
-        readonly ILog _log;
-        readonly int _maxDeliveryAttempts;
-        readonly ConcurrentDictionary<string, ErrorTracking> _trackedErrors = new ConcurrentDictionary<string, ErrorTracking>();
-        readonly IAsyncTask _cleanupOldTrackedErrorsTask;
+        _simpleRetryStrategySettings = simpleRetryStrategySettings ?? throw new ArgumentNullException(nameof(simpleRetryStrategySettings));
+        _transport = transport ?? throw new ArgumentNullException(nameof(transport));
+        _rebusTime = rebusTime ?? throw new ArgumentNullException(nameof(rebusTime));
 
-        bool _disposed;
+        _log = rebusLoggerFactory.GetLogger<InMemErrorTracker>();
 
-        /// <summary>
-        /// Constructs the in-mem error tracker with the configured number of delivery attempts as the MAX
-        /// </summary>
-        public InMemErrorTracker(int maxDeliveryAttempts, IRebusLoggerFactory rebusLoggerFactory, IAsyncTaskFactory asyncTaskFactory)
+        _cleanupOldTrackedErrorsTask = asyncTaskFactory.Create(
+            BackgroundTaskName,
+            CleanupOldTrackedErrors,
+            intervalSeconds: 10
+        );
+    }
+
+    /// <summary>
+    /// Initializes the in-mem error tracker - starts a background task that periodically cleans up tracked errors that haven't had any activity for 10 minutes or more
+    /// </summary>
+    public void Initialize()
+    {
+        // if it's a one-way client, then there's no reason to start the task
+        if (string.IsNullOrWhiteSpace(_transport.Address)) return;
+
+        _cleanupOldTrackedErrorsTask.Start();
+    }
+
+    /// <summary>
+    /// Marks the given <paramref name="messageId"/> as "FINAL", meaning that it should be considered as "having failed too many times now"
+    /// </summary>
+    public void MarkAsFinal(string messageId)
+    {
+        _trackedErrors.AddOrUpdate(messageId,
+            id => new ErrorTracking(_rebusTime, final: true),
+            (id, tracking) => tracking.MarkAsFinal());
+    }
+
+    /// <summary>
+    /// Registers the given <paramref name="exception"/> under the supplied <paramref name="messageId"/>
+    /// </summary>
+    public void RegisterError(string messageId, Exception exception)
+    {
+        var errorTracking = _trackedErrors.AddOrUpdate(messageId,
+            id => new ErrorTracking(_rebusTime, exception),
+            (id, tracking) => tracking.AddError(_rebusTime, exception, tracking.Final));
+
+        var message = errorTracking.Final
+            ? "Unhandled exception {errorNumber} (FINAL) while handling message with ID {messageId}"
+            : "Unhandled exception {errorNumber} while handling message with ID {messageId}";
+
+        _log.Warn(exception, message, errorTracking.Errors.Count(), messageId);
+    }
+
+    /// <summary>
+    /// Gets whether too many errors have been tracked for the given <paramref name="messageId"/>
+    /// </summary>
+    public bool HasFailedTooManyTimes(string messageId)
+    {
+        var hasTrackingForThisMessage = _trackedErrors.TryGetValue(messageId, out var existingTracking);
+        if (!hasTrackingForThisMessage) return false;
+
+        var hasFailedTooManyTimes = existingTracking.Final
+                                    || existingTracking.ErrorCount >= _simpleRetryStrategySettings.MaxDeliveryAttempts;
+
+        return hasFailedTooManyTimes;
+    }
+
+    /// <summary>
+    /// Gets a short description of the tracked errors for the given <paramref name="messageId"/> on the form
+    /// "n unhandled exceptions"
+    /// </summary>
+    public string GetShortErrorDescription(string messageId)
+    {
+        return _trackedErrors.TryGetValue(messageId, out var errorTracking)
+            ? $"{errorTracking.Errors.Count()} unhandled exceptions"
+            : null;
+    }
+
+    /// <summary>
+    /// Gets a long and detailed description of the tracked errors for the given <paramref name="messageId"/>
+    /// consisting of time and full exception details for all registered exceptions
+    /// </summary>
+    public string GetFullErrorDescription(string messageId)
+    {
+        if (!_trackedErrors.TryGetValue(messageId, out var errorTracking))
         {
-            _maxDeliveryAttempts = maxDeliveryAttempts;
-            _log = rebusLoggerFactory.GetCurrentClassLogger();
-            _cleanupOldTrackedErrorsTask = asyncTaskFactory.Create(BackgroundTaskName, CleanupOldTrackedErrors, intervalSeconds: 60);
+            return null;
         }
 
-        /// <summary>
-        /// Initializes the in-mem error tracker - starts a background task that periodically cleans up tracked errors that haven't had any activity for 10 minutes or more
-        /// </summary>
-        public void Initialize()
+        var fullExceptionInfo = string.Join(Environment.NewLine, errorTracking.Errors.Select(e =>
+            $"{e.Time}: {e.Exception}"));
+
+        return $"{errorTracking.Errors.Count()} unhandled exceptions: {fullExceptionInfo}";
+    }
+
+    /// <summary>
+    /// Gets all caught exceptions for the message ID
+    /// </summary>
+    public IEnumerable<Exception> GetExceptions(string messageId)
+    {
+        if (!_trackedErrors.TryGetValue(messageId, out var errorTracking))
         {
-            _cleanupOldTrackedErrorsTask.Start();
+            return Enumerable.Empty<Exception>();
         }
 
-        /// <summary>
-        /// Registers the given <paramref name="exception"/> under the supplied <paramref name="messageId"/>
-        /// </summary>
-        public void RegisterError(string messageId, Exception exception)
-        {
-            var errorTracking = _trackedErrors.AddOrUpdate(messageId,
-                id => new ErrorTracking(exception),
-                (id, tracking) => tracking.AddError(exception));
+        return errorTracking.Errors
+            .Select(e => e.Exception)
+            .ToList();
+    }
 
-            _log.Warn("Unhandled exception {0} while handling message with ID {1}: {2}", errorTracking.Errors.Count(), messageId, exception);
+    /// <summary>
+    /// Cleans up whichever tracking wr have done for the given <paramref name="messageId"/>
+    /// </summary>
+    public void CleanUp(string messageId) => RemoveTracking(messageId);
+
+    async Task CleanupOldTrackedErrors()
+    {
+        var maxAge = TimeSpan.FromMinutes(_simpleRetryStrategySettings.ErrorTrackingMaxAgeMinutes);
+
+        var messageIdsOfExpiredTrackings = _trackedErrors
+            .Where(e => e.Value.ElapsedSinceLastError > maxAge)
+            .Select(t => t.Key)
+            .ToList();
+
+        foreach (var messageId in messageIdsOfExpiredTrackings)
+        {
+            RemoveTracking(messageId);
+        }
+    }
+
+    void RemoveTracking(string messageId) => _trackedErrors.TryRemove(messageId, out _);
+
+    class ErrorTracking
+    {
+        readonly IRebusTime _rebusTime;
+        readonly CaughtException[] _caughtExceptions;
+
+        ErrorTracking(IRebusTime rebusTime, IEnumerable<CaughtException> caughtExceptions, bool final = false)
+        {
+            _rebusTime = rebusTime;
+            Final = final;
+            _caughtExceptions = caughtExceptions.ToArray();
         }
 
-        /// <summary>
-        /// Gets whether too many errors have been tracked for the given <paramref name="messageId"/>
-        /// </summary>
-        public bool HasFailedTooManyTimes(string messageId)
+        public ErrorTracking(IRebusTime rebusTime, Exception exception = null, bool final = false)
+            : this(rebusTime, exception != null ? new[] { new CaughtException(rebusTime.Now, exception) } : new CaughtException[0], final)
         {
-            ErrorTracking existingTracking;
-            var hasTrackingForThisMessage = _trackedErrors.TryGetValue(messageId, out existingTracking);
-
-            if (!hasTrackingForThisMessage) return false;
-
-            var hasFailedTooManyTimes = existingTracking.ErrorCount >= _maxDeliveryAttempts;
-
-            return hasFailedTooManyTimes;
         }
 
-        /// <summary>
-        /// Gets a short description of the tracked errors for the given <paramref name="messageId"/> on the form
-        /// "n unhandled exceptions"
-        /// </summary>
-        public string GetShortErrorDescription(string messageId)
-        {
-            ErrorTracking errorTracking;
+        public int ErrorCount => _caughtExceptions.Length;
 
-            if (!_trackedErrors.TryGetValue(messageId, out errorTracking))
+        public bool Final { get; }
+
+        public IEnumerable<CaughtException> Errors => _caughtExceptions;
+
+        public ErrorTracking AddError(IRebusTime rebusTime, Exception caughtException, bool final)
+        {
+            //// don't change anymore if this one is already final
+            //if (Final) return this;
+
+            return new ErrorTracking(rebusTime, _caughtExceptions.Concat(new[] { new CaughtException(_rebusTime.Now, caughtException) }), final);
+        }
+
+        public TimeSpan ElapsedSinceLastError
+        {
+            get
             {
-                return "Could not get error details for the message";
+                var timeOfMostRecentError = _caughtExceptions.Max(e => e.Time);
+                var elapsedSinceLastError = timeOfMostRecentError.ElapsedUntilNow(_rebusTime);
+                return elapsedSinceLastError;
             }
-
-            return string.Format("{0} unhandled exceptions", errorTracking.Errors.Count());
         }
 
-        /// <summary>
-        /// Gets a long and detailed description of the tracked errors for the given <paramref name="messageId"/>
-        /// consisting of time and full exception details for all registered exceptions
-        /// </summary>
-        public string GetFullErrorDescription(string messageId)
+        public ErrorTracking MarkAsFinal() => new ErrorTracking(_rebusTime, _caughtExceptions, final: true);
+    }
+
+    class CaughtException
+    {
+        public CaughtException(DateTimeOffset time, Exception exception)
         {
-            ErrorTracking errorTracking;
-
-            if (!_trackedErrors.TryGetValue(messageId, out errorTracking))
-            {
-                return "Could not get error details for the message";
-            }
-
-            var fullExceptionInfo = string.Join(Environment.NewLine, errorTracking.Errors.Select(e => string.Format("{0}: {1}", e.Time, e.Exception)));
-
-            return string.Format("{0} unhandled exceptions: {1}", errorTracking.Errors.Count(), fullExceptionInfo);
+            Exception = exception ?? throw new ArgumentNullException(nameof(exception));
+            Time = time;
         }
 
-        /// <summary>
-        /// Cleans up whichever tracking wr have done for the given <paramref name="messageId"/>
-        /// </summary>
-        public void CleanUp(string messageId)
+        public Exception Exception { get; }
+        public DateTimeOffset Time { get; }
+    }
+
+    /// <summary>
+    /// Stops the periodic cleanup of tracked messages
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed) return;
+
+        try
         {
-            ErrorTracking dummy;
-            _trackedErrors.TryRemove(messageId, out dummy);
+            _cleanupOldTrackedErrorsTask.Dispose();
         }
-
-        async Task CleanupOldTrackedErrors()
+        finally
         {
-            ErrorTracking _;
-
-            _trackedErrors
-                .ToList()
-                .Where(e => e.Value.ElapsedSinceLastError > TimeSpan.FromMinutes(10))
-                .ForEach(tracking => _trackedErrors.TryRemove(tracking.Key, out _));
+            _disposed = true;
         }
-
-        class ErrorTracking
-        {
-            readonly ConcurrentQueue<CaughtException> _caughtExceptions = new ConcurrentQueue<CaughtException>();
-
-            public ErrorTracking(Exception exception)
-            {
-                AddError(exception);
-            }
-
-            public int ErrorCount
-            {
-                get { return _caughtExceptions.Count; }
-            }
-
-            public IEnumerable<CaughtException> Errors
-            {
-                get { return _caughtExceptions; }
-            }
-
-            public ErrorTracking AddError(Exception caughtException)
-            {
-                _caughtExceptions.Enqueue(new CaughtException(caughtException));
-                return this;
-            }
-
-            public TimeSpan ElapsedSinceLastError
-            {
-                get
-                {
-                    var timeOfMostRecentError = _caughtExceptions.Max(e => e.Time);
-
-                    var elapsedSinceLastError = timeOfMostRecentError.ElapsedUntilNow();
-
-                    return elapsedSinceLastError;
-                }
-            }
-        }
-
-        class CaughtException
-        {
-            public CaughtException(Exception exception)
-            {
-                Exception = exception;
-                Time = RebusTime.Now;
-            }
-
-            public Exception Exception { get; private set; }
-            public DateTimeOffset Time { get; private set; }
-        }
-
-        /// <summary>
-        /// Stops the periodic cleanup of tracked messages
-        /// </summary>
-        public void Dispose()
-        {
-            if (_disposed) return;
-
-            try
-            {
-                _cleanupOldTrackedErrorsTask.Dispose();
-            }
-            finally
-            {
-                _disposed = true;
-            }
-        }
-
     }
 }

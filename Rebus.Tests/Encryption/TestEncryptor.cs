@@ -1,21 +1,21 @@
 ﻿using System;
 using NUnit.Framework;
 using Rebus.Encryption;
+using Rebus.Tests.Contracts;
 
-namespace Rebus.Tests.Encryption
+namespace Rebus.Tests.Encryption;
+
+[TestFixture]
+public class TestEncryptor : FixtureBase
 {
-    [TestFixture]
-    public class TestEncryptor : FixtureBase
+    [Test]
+    public void CanSuggestNewKeyIfInitializedWithErronousKey()
     {
-        [Test]
-        public void CanSuggestNewKeyIfInitializedWithErronousKey()
+        var argumentException = Assert.Throws<ArgumentException>(() =>
         {
-            var argumentException = Assert.Throws<ArgumentException>(() =>
-            {
-                new Encryptor("not a valid key");
-            });
+            new RijndaelEncryptor("not a valid key");
+        });
 
-            Console.WriteLine(argumentException);
-        }
+        Console.WriteLine(argumentException);
     }
 }

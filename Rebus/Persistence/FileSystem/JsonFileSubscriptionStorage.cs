@@ -10,149 +10,125 @@ using Rebus.Extensions;
 using Rebus.Subscriptions;
 #pragma warning disable 1998
 
-namespace Rebus.Persistence.FileSystem
+namespace Rebus.Persistence.FileSystem;
+
+/// <summary>
+/// Implementation of <see cref="ISubscriptionStorage"/> that stores subscriptions in a JSON file. Access to the file is synchronized within the process with a <see cref="ReaderWriterLockSlim"/>
+/// </summary>
+public class JsonFileSubscriptionStorage : ISubscriptionStorage, IDisposable
 {
+    static readonly Encoding FileEncoding = Encoding.UTF8;
+
+    readonly ReaderWriterLockSlim _readerWriterLockSlim = new ReaderWriterLockSlim();
+    readonly string _jsonFilePath;
+
+    bool _disposed;
+
     /// <summary>
-    /// Implementation of <see cref="ISubscriptionStorage"/> that stores subscriptions in a JSON file. Access to the file is synchronized within the process with a <see cref="ReaderWriterLockSlim"/>
+    /// Constructs the subscription storage
     /// </summary>
-    public class JsonFileSubscriptionStorage : ISubscriptionStorage, IDisposable
+    public JsonFileSubscriptionStorage(string jsonFilePath, bool isCentralized = false)
     {
-        static readonly Encoding FileEncoding = Encoding.UTF8;
+        _jsonFilePath = jsonFilePath ?? throw new ArgumentNullException(nameof(jsonFilePath));
+        IsCentralized = isCentralized;
+    }
 
-        readonly ReaderWriterLockSlim _readerWriterLockSlim = new ReaderWriterLockSlim();
-        readonly string _jsonFilePath;
-
-        bool _disposed;
-
-        /// <summary>
-        /// Constructs the subscription storage
-        /// </summary>
-        public JsonFileSubscriptionStorage(string jsonFilePath)
+    /// <summary>
+    /// Gets all subscribers of the given topic from the JSON file
+    /// </summary>
+    public async Task<string[]> GetSubscriberAddresses(string topic)
+    {
+        // !!! DONT USE ASYNC/AWAIT IN HERE BECAUSE OF THE READERWRITERLOCKSLIM
+        using (_readerWriterLockSlim.ReadLock())
         {
-            _jsonFilePath = jsonFilePath;
+            var subscriptions = GetSubscriptions();
+
+            return subscriptions.TryGetValue(topic, out var subscribers)
+                ? subscribers.ToArray()
+                : new string[0];
         }
+    }
 
-        /// <summary>
-        /// Last-resort disposal of the <see cref="ReaderWriterLockSlim"/>
-        /// </summary>
-        ~JsonFileSubscriptionStorage()
+    /// <summary>
+    /// Adds the subscriber to the list of subscribers from the given topic
+    /// </summary>
+    public async Task RegisterSubscriber(string topic, string subscriberAddress)
+    {
+        // !!! DONT USE ASYNC/AWAIT IN HERE BECAUSE OF THE READERWRITERLOCKSLIM
+        using (_readerWriterLockSlim.WriteLock())
         {
-            Dispose(false);
+            var subscriptions = GetSubscriptions();
+
+            subscriptions
+                .GetOrAdd(topic, () => new HashSet<string>())
+                .Add(subscriberAddress);
+
+            SaveSubscriptions(subscriptions);
         }
+    }
 
-        /// <summary>
-        /// Gets all subscribers of the given topic from the JSON file
-        /// </summary>
-        public async Task<string[]> GetSubscriberAddresses(string topic)
+    /// <summary>
+    /// Removes the subscriber from the list of subscribers of the given topic
+    /// </summary>
+    public async Task UnregisterSubscriber(string topic, string subscriberAddress)
+    {
+        // !!! DONT USE ASYNC/AWAIT IN HERE BECAUSE OF THE READERWRITERLOCKSLIM
+        using (_readerWriterLockSlim.WriteLock())
         {
-            // !!! DONT USE ASYNC/AWAIT IN HERE BECAUSE OF THE READERWRITERLOCKSLIM
-            using (_readerWriterLockSlim.ReadLock())
-            {
-                var subscriptions = GetSubscriptions();
+            var subscriptions = GetSubscriptions();
 
-                HashSet<string> subscribers;
+            subscriptions
+                .GetOrAdd(topic, () => new HashSet<string>())
+                .Remove(subscriberAddress);
 
-                return subscriptions.TryGetValue(topic, out subscribers)
-                    ? subscribers.ToArray()
-                    : new string[0];
-            }
+            SaveSubscriptions(subscriptions);
         }
+    }
 
-        /// <summary>
-        /// Adds the subscriber to the list of subscribers from the given topic
-        /// </summary>
-        public async Task RegisterSubscriber(string topic, string subscriberAddress)
+    void SaveSubscriptions(Dictionary<string, HashSet<string>> subscriptions)
+    {
+        // !!! DONT USE ASYNC/AWAIT IN HERE BECAUSE OF THE READERWRITERLOCKSLIM
+        var jsonText = JsonConvert.SerializeObject(subscriptions, Formatting.Indented);
+
+        File.WriteAllText(_jsonFilePath, jsonText, FileEncoding);
+    }
+
+    Dictionary<string, HashSet<string>> GetSubscriptions()
+    {
+        // !!! DONT USE ASYNC/AWAIT IN HERE BECAUSE OF THE READERWRITERLOCKSLIM
+        try
         {
-            // !!! DONT USE ASYNC/AWAIT IN HERE BECAUSE OF THE READERWRITERLOCKSLIM
-            using (_readerWriterLockSlim.WriteLock())
-            {
-                var subscriptions = GetSubscriptions();
+            var jsonText = File.ReadAllText(_jsonFilePath, FileEncoding);
 
-                subscriptions
-                    .GetOrAdd(topic, () => new HashSet<string>())
-                    .Add(subscriberAddress);
+            var subscriptions = JsonConvert.DeserializeObject<Dictionary<string, HashSet<string>>>(jsonText);
 
-                SaveSubscriptions(subscriptions);
-            }
+            return subscriptions;
         }
-
-        /// <summary>
-        /// Removes the subscriber from the list of subscribers of the given topic
-        /// </summary>
-        public async Task UnregisterSubscriber(string topic, string subscriberAddress)
+        catch (FileNotFoundException)
         {
-            // !!! DONT USE ASYNC/AWAIT IN HERE BECAUSE OF THE READERWRITERLOCKSLIM
-            using (_readerWriterLockSlim.WriteLock())
-            {
-                var subscriptions = GetSubscriptions();
-
-                subscriptions
-                    .GetOrAdd(topic, () => new HashSet<string>())
-                    .Remove(subscriberAddress);
-
-                SaveSubscriptions(subscriptions);
-            }
+            return new Dictionary<string, HashSet<string>>();
         }
+    }
 
-        void SaveSubscriptions(Dictionary<string, HashSet<string>> subscriptions)
+    /// <summary>
+    /// Gets whether this subscription storage is centralized (which it shouldn't be - that would probably cause some pretty nasty locking exceptions!)
+    /// </summary>
+    public bool IsCentralized { get; }
+
+    /// <summary>
+    /// Disposes the <see cref="ReaderWriterLockSlim"/> that guards access to the file
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed) return;
+
+        try
         {
-            // !!! DONT USE ASYNC/AWAIT IN HERE BECAUSE OF THE READERWRITERLOCKSLIM
-            var jsonText = JsonConvert.SerializeObject(subscriptions, Formatting.Indented);
-
-            File.WriteAllText(_jsonFilePath, jsonText, FileEncoding);
+            _readerWriterLockSlim.Dispose();
         }
-
-        Dictionary<string, HashSet<String>> GetSubscriptions()
+        finally
         {
-            // !!! DONT USE ASYNC/AWAIT IN HERE BECAUSE OF THE READERWRITERLOCKSLIM
-            try
-            {
-                var jsonText = File.ReadAllText(_jsonFilePath, FileEncoding);
-
-                var subscriptions = JsonConvert.DeserializeObject<Dictionary<string, HashSet<String>>>(jsonText);
-
-                return subscriptions;
-            }
-            catch (FileNotFoundException)
-            {
-                return new Dictionary<string, HashSet<string>>();
-            }
-        }
-
-        /// <summary>
-        /// Gets whether this subscription storage is centralized (which it shouldn't be - that would probably cause some pretty nasty locking exceptions!)
-        /// </summary>
-        public bool IsCentralized
-        {
-            get { return false; }
-        }
-
-        /// <summary>
-        /// Releases the reader/writer lock held by the subscription storage
-        /// </summary>
-        protected virtual void Dispose(bool disposing)
-        {
-            if (_disposed) return;
-
-            try
-            {
-                if (disposing)
-                {
-                    _readerWriterLockSlim.Dispose();
-                }
-            }
-            finally
-            {
-                _disposed = true;
-            }
-        }
-
-        /// <summary>
-        /// Disposes the <see cref="ReaderWriterLockSlim"/> that guards access to the file
-        /// </summary>
-        public void Dispose()
-        {
-            Dispose(false);
+            _disposed = true;
         }
     }
 }

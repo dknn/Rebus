@@ -7,133 +7,205 @@ using NUnit.Framework;
 using Rebus.Activation;
 using Rebus.Bus;
 using Rebus.Config;
+using Rebus.Exceptions;
 using Rebus.Messages;
 using Rebus.Retry.Simple;
+using Rebus.Tests.Contracts;
+using Rebus.Tests.Contracts.Extensions;
+using Rebus.Tests.Contracts.Utilities;
+using Rebus.Tests.Extensions;
 using Rebus.Transport.InMem;
 #pragma warning disable 1998
 
-namespace Rebus.Tests.Integration
+namespace Rebus.Tests.Integration;
+
+[TestFixture]
+public class TestSecondLevelRetries : FixtureBase
 {
-    [TestFixture]
-    public class TestSecondLevelRetries : FixtureBase
+    const string InputQueueName = "2nd level goodness";
+    BuiltinHandlerActivator _activator;
+    IBus _bus;
+    InMemNetwork _network;
+
+    protected override void SetUp()
     {
-        const string InputQueueName = "2nd level goodness";
-        BuiltinHandlerActivator _activator;
-        IBus _bus;
-        InMemNetwork _network;
+        _activator = Using(new BuiltinHandlerActivator());
 
-        protected override void SetUp()
+        _network = new InMemNetwork();
+
+        _bus = Configure.With(_activator)
+            .Transport(t => t.UseInMemoryTransport(_network, InputQueueName))
+            .Options(o => o.SimpleRetryStrategy(secondLevelRetriesEnabled: true))
+            .Start();
+    }
+
+    [Test]
+    public async Task ItWorksWithCovarianceToo()
+    {
+        var counter = new SharedCounter(1);
+
+        Using(counter);
+
+        _activator.AddHandlerWithBusTemporarilyStopped<BaseMessage>(async baseMessage => throw new RebusApplicationException("1st level!!"));
+
+        _activator.AddHandlerWithBusTemporarilyStopped<IFailed<BaseMessage>>(async failed =>
         {
-            _activator = Using(new BuiltinHandlerActivator());
-
-            _network = new InMemNetwork();
-
-            _bus = Configure.With(_activator)
-                .Transport(t => t.UseInMemoryTransport(_network, InputQueueName))
-                .Options(o => o.SimpleRetryStrategy(secondLevelRetriesEnabled: true))
-                .Start();
-        }
-
-        [Test]
-        public async Task ItWorks()
-        {
-            var counter = new SharedCounter(1);
-
-            Using(counter);
-
-            _activator.Handle<string>(async str =>
+            if (failed.Message is ConcreteMessage)
             {
-                throw new ApplicationException("1st level!!");
-            });
-
-            _activator.Handle<Failed<string>>(async failed =>
-            {
-                if (failed.Message != "hej med dig!")
-                {
-                    counter.Fail("Did not receive the expected message!");
-                    return;
-                }
-
                 counter.Decrement();
-            });
+                return;
+            }
 
-            await _bus.SendLocal("hej med dig!");
+            counter.Fail("Did not receive the expected message!");
+        });
 
-            counter.WaitForResetEvent();
-        }
+        await _bus.SendLocal(new ConcreteMessage());
 
-        [Test]
-        public async Task StillWorksWhenIncomingMessageCannotBeDeserialized()
+        counter.WaitForResetEvent();
+    }
+
+    abstract class BaseMessage { }
+
+    class ConcreteMessage : BaseMessage { }
+
+    [Test]
+    public async Task ItWorks()
+    {
+        var counter = new SharedCounter(1);
+
+        Using(counter);
+
+        _activator.AddHandlerWithBusTemporarilyStopped<string>(async str =>
         {
-            const string brokenJsonString = @"{'broken': 'json', // DIE!!1}";
+            throw new RebusApplicationException("1st level!!");
+        });
 
-            var headers = new Dictionary<string, string>
-            {
-                {Headers.MessageId, Guid.NewGuid().ToString()},
-                {Headers.ContentType, "application/json;charset=utf-8"},
-            };
-            var body = Encoding.UTF8.GetBytes(brokenJsonString);
-            var transportMessage = new TransportMessage(headers, body);
-            var inMemTransportMessage = new InMemTransportMessage(transportMessage);  
-            _network.Deliver(InputQueueName, inMemTransportMessage);
-
-            await Task.Delay(1000);
-
-            var failedMessage = _network.GetNextOrNull("error");
-
-            Assert.That(failedMessage, Is.Not.Null);
-            var bodyString = Encoding.UTF8.GetString(failedMessage.Body);
-            Assert.That(bodyString, Is.EqualTo(brokenJsonString));
-        }
-
-        [Test]
-        public async Task FailedMessageAllowsForAccessingHeaders()
+        _activator.AddHandlerWithBusTemporarilyStopped<IFailed<string>>(async failed =>
         {
-            var counter = new SharedCounter(1);
-
-            Using(counter);
-
-            _activator.Handle<string>(async str =>
+            if (failed.Message != "hej med dig!")
             {
-                throw new ApplicationException("1st level!!");
-            });
+                counter.Fail("Did not receive the expected message!");
+                return;
+            }
 
-            var headersOfFailedMessage = new Dictionary<string,string>();
+            counter.Decrement();
+        });
 
-            _activator.Handle<Failed<string>>(async failed =>
+        await _bus.SendLocal("hej med dig!");
+
+        counter.WaitForResetEvent();
+    }
+
+    [Test]
+    public async Task IncludesFullErrorDetailsWhenSecondLevelRetriesFailToo()
+    {
+        var counter = new SharedCounter(1);
+
+        Using(counter);
+
+        _activator.AddHandlerWithBusTemporarilyStopped<string>(async str =>
+        {
+            throw new RebusApplicationException("1st level!!");
+        });
+
+        _activator.AddHandlerWithBusTemporarilyStopped<IFailed<string>>(async failed =>
+        {
+            throw new RebusApplicationException("2nd level!!");
+        });
+
+        await _bus.SendLocal("hej med dig!");
+
+        var transportMessage = await _network.WaitForNextMessageFrom("error");
+        var errorDetails = transportMessage.Headers[Headers.ErrorDetails];
+
+        Console.WriteLine(errorDetails);
+
+        Assert.That(errorDetails, Does.Contain("1st level!!"));
+        Assert.That(errorDetails, Does.Contain("2nd level!!"));
+    }
+
+    [Test]
+    public async Task StillWorksWhenIncomingMessageCannotBeDeserialized()
+    {
+        const string brokenJsonString = @"{'broken': 'json', // DIE!!1}";
+
+        var headers = new Dictionary<string, string>
+        {
+            {Headers.MessageId, Guid.NewGuid().ToString()},
+            {Headers.ContentType, "application/json;charset=utf-8"},
+        };
+        var body = Encoding.UTF8.GetBytes(brokenJsonString);
+        var transportMessage = new TransportMessage(headers, body);
+        var inMemTransportMessage = new InMemTransportMessage(transportMessage);
+        _network.Deliver(InputQueueName, inMemTransportMessage);
+
+        var failedMessage = await _network.WaitForNextMessageFrom("error");
+
+        Assert.That(failedMessage, Is.Not.Null);
+        var bodyString = Encoding.UTF8.GetString(failedMessage.Body);
+        Assert.That(bodyString, Is.EqualTo(brokenJsonString));
+    }
+
+    [Test]
+    public async Task FailedMessageAllowsForAccessingHeaders()
+    {
+        var counter = new SharedCounter(1);
+
+        Using(counter);
+
+        _activator.AddHandlerWithBusTemporarilyStopped<string>(async str =>
+        {
+            throw new RebusApplicationException("1st level!!");
+        });
+
+        var headersOfFailedMessage = new Dictionary<string, string>();
+
+        _activator.AddHandlerWithBusTemporarilyStopped<IFailed<string>>(async failed =>
+        {
+            if (failed.Message != "hej med dig!")
             {
-                if (failed.Message != "hej med dig!")
-                {
-                    counter.Fail("Did not receive the expected message!");
-                    return;
-                }
+                counter.Fail("Did not receive the expected message!");
+                return;
+            }
 
-                foreach (var kvp in failed.Headers)
-                {
-                    headersOfFailedMessage.Add(kvp.Key, kvp.Value);
-                }
-
-                Console.WriteLine();
-                Console.WriteLine("----------------------------------------------------------------------------------------------------");
-                Console.WriteLine(failed.ErrorDescription);
-                Console.WriteLine("----------------------------------------------------------------------------------------------------");
-                Console.WriteLine();
-
-                counter.Decrement();
-            });
-
-            var headers = new Dictionary<string, string>
+            foreach (var kvp in failed.Headers)
             {
-                {"custom-header", "with-a-custom-value" }
-            };
+                headersOfFailedMessage.Add(kvp.Key, kvp.Value);
+            }
 
-            await _bus.SendLocal("hej med dig!", headers);
+            Console.WriteLine();
+            Console.WriteLine("-------------------------------------------------------------------------------------------------------------------------------------------------------------");
+            Console.WriteLine("-------------------------------------------------------------------------------------------------------------------------------------------------------------");
+            Console.WriteLine("-------------------------------------------------------------------------------------------------------------------------------------------------------------");
+            Console.WriteLine("ERROR DESCRIPTION:");
+            Console.WriteLine();
+            Console.WriteLine(failed.ErrorDescription);
+            Console.WriteLine("-------------------------------------------------------------------------------------------------------------------------------------------------------------");
+            Console.WriteLine("-------------------------------------------------------------------------------------------------------------------------------------------------------------");
+            Console.WriteLine("-------------------------------------------------------------------------------------------------------------------------------------------------------------");
+            Console.WriteLine("CAUGHT EXCEPTIONS:");
+            Console.WriteLine();
+            Console.WriteLine(string.Join(Environment.NewLine + Environment.NewLine, failed.Exceptions));
+            Console.WriteLine("-------------------------------------------------------------------------------------------------------------------------------------------------------------");
+            Console.WriteLine("-------------------------------------------------------------------------------------------------------------------------------------------------------------");
+            Console.WriteLine("-------------------------------------------------------------------------------------------------------------------------------------------------------------");
+            Console.WriteLine();
 
-            counter.WaitForResetEvent();
+            counter.Decrement();
+        });
 
-            Console.WriteLine(string.Join(Environment.NewLine , headersOfFailedMessage.Select(kvp => string.Format("    {0}: {1}", kvp.Key, kvp.Value))));
+        var headers = new Dictionary<string, string>
+        {
+            {"custom-header", "with-a-custom-value" }
+        };
 
-            Assert.That(headersOfFailedMessage["custom-header"], Is.EqualTo("with-a-custom-value"));
-        }
+        await _bus.SendLocal("hej med dig!", headers);
+
+        counter.WaitForResetEvent();
+
+        Console.WriteLine(string.Join(Environment.NewLine, headersOfFailedMessage.Select(kvp =>
+            $"    {kvp.Key}: {kvp.Value}")));
+
+        Assert.That(headersOfFailedMessage["custom-header"], Is.EqualTo("with-a-custom-value"));
     }
 }
